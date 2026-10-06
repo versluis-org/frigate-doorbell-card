@@ -9,6 +9,14 @@ A Home Assistant dashboard card for doorbells (and other cameras) in [Frigate](h
 - **Chime button** (optional): turn the doorbell chime on/off, e.g. when the baby is asleep
 - Works on iPhone (sound starts immediately), Safari, Chrome; light and dark mode; Dutch and English
 
+<p align="center">
+  <img src="docs/popup-live.png" width="300" alt="Live view in a Bubble Card pop-up">
+  <img src="docs/talking.png" width="300" alt="Holding the microphone button to talk">
+  <img src="docs/playback.png" width="300" alt="Playing back a recording from the timeline">
+</p>
+<p align="center"><sub>Live in a pop-up · holding the button to talk · playing back an event from the timeline
+(camera image blurred for privacy)</sub></p>
+
 Everything goes through the **Frigate integration** in Home Assistant with your own HA login:
 no extra proxies, ports or tokens.
 
@@ -66,6 +74,31 @@ The card has a visual editor as well.
 | Two-way audio available | go2rtc's answer when connecting; without it the microphone button is hidden with an explanation |
 | Microphone allowed | https or not; without it the button is hidden with an explanation |
 | Chime | exactly one `number.*chime*volume` entity |
+
+## As a pop-up
+
+The card works well in a pop-up, e.g. with [Bubble Card](https://github.com/Clooos/Bubble-Card): a button on your
+dashboard opens the doorbell, and the stream (and microphone) only run while the pop-up is open.
+
+```yaml
+type: custom:bubble-card
+card_type: pop-up
+hash: '#doorbell'
+name: Front door
+icon: mdi:doorbell-video
+# less padding left/right so the picture is as large as possible
+styles: |
+  .bubble-pop-up-container { padding-left: 4px !important; padding-right: 4px !important; }
+cards:
+  - type: custom:frigate-doorbell-card
+    camera: camera.front_door
+```
+
+Open it from any button with `tap_action: { action: navigate, navigation_path: '#doorbell' }`, or automatically
+when someone rings (e.g. with [browser_mod](https://github.com/thomasloven/hass-browser_mod)).
+
+The card pauses itself when it isn't visible (closed pop-up, other tab, scrolled away) and reconnects when it
+becomes visible again.
 
 ## Frigate configuration
 
