@@ -10,9 +10,9 @@ A Home Assistant dashboard card for doorbells (and other cameras) in [Frigate](h
 - Works on iPhone (sound starts immediately), Safari, Chrome; light and dark mode; Dutch and English
 
 <p align="center">
-  <img src="docs/popup-live.png" width="300" alt="Live view in a Bubble Card pop-up">
-  <img src="docs/talking.png" width="300" alt="Holding the microphone button to talk">
-  <img src="docs/playback.png" width="300" alt="Playing back a recording from the timeline">
+  <img src="https://raw.githubusercontent.com/versluis-org/frigate-doorbell-card/main/docs/popup-live.png" width="300" alt="Live view in a Bubble Card pop-up">
+  <img src="https://raw.githubusercontent.com/versluis-org/frigate-doorbell-card/main/docs/talking.png" width="300" alt="Holding the microphone button to talk">
+  <img src="https://raw.githubusercontent.com/versluis-org/frigate-doorbell-card/main/docs/playback.png" width="300" alt="Playing back a recording from the timeline">
 </p>
 <p align="center"><sub>Live in a pop-up · holding the button to talk · playing back an event from the timeline
 (camera image blurred for privacy)</sub></p>
