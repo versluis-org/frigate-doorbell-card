@@ -2,7 +2,8 @@
 
 A Home Assistant dashboard card for doorbells (and other cameras) in [Frigate](https://frigate.video):
 
-- **Live view** with sound (WebRTC via go2rtc), automatic reconnect when the stream drops or freezes
+- **Live view** with sound (WebRTC via go2rtc), automatic reconnect when the stream drops or freezes,
+  and automatic fallback to a stream via Home Assistant when you're away from home
 - **Push-to-talk**: hold the microphone button to talk through the doorbell's speaker (two-way audio)
 - **Timeline** like a Ring doorbell: drag to scrub, tap a thumbnail to jump to an event, pinch/scroll to zoom
 - **Playback** of Frigate recordings with sound, the timeline follows along
@@ -169,8 +170,12 @@ for the RTSP producer.
 
 ## Notes
 
-- **Live view from outside your home**: the video goes directly between browser and go2rtc (WebRTC).
-  That works on your LAN and over VPN; from the internet it needs go2rtc's port 8555 to be reachable.
+- **Live view from outside your home**: the card first tries a direct WebRTC connection to go2rtc (lowest delay,
+  needed for talking). That works on your LAN, over VPN, or from the internet when go2rtc's port 8555 is reachable.
+  If it doesn't connect within 8 seconds, the card automatically switches to a stream **via Home Assistant**
+  (go2rtc MSE through the Frigate integration): works wherever Home Assistant works, ~1–2 s more delay,
+  and the microphone button is hidden because talking needs the direct connection. The card remembers this for
+  10 minutes so it doesn't wait again every time.
 - **iPhone**: sound starts immediately because the card unlocks audio on your first tap in Home Assistant.
 - Playback uses the browser's own HLS player on Safari/iOS and [hls.js](https://github.com/video-dev/hls.js) elsewhere
   (loaded from cdnjs when needed).
