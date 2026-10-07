@@ -13,13 +13,14 @@
  * https://github.com/versluis-org/frigate-doorbell-card
  */
 
-const CARD_VERSION = '0.2.0';
+const CARD_VERSION = '0.3.0';
 const HLS_JS = 'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.20/hls.min.js';
 const TL_H = 84;                  // timeline height (px)
 const CHUNK = 6 * 3600;           // fetch recordings in blocks of 6 hours
 const LIVE_EDGE = 20;             // within 20 s of now = live
-const WEBRTC_TIMEOUT = 8000;      // no direct connection within 8 s → stream via Home Assistant
-const WEBRTC_RETRY_AFTER = 600000; // after a failed direct connection, use the HA route for 10 min
+const FAST_FALLBACK = 3000;       // no direct picture within 3 s → also start the stream via Home Assistant
+const WEBRTC_GIVE_UP = 15000;     // stop trying the direct connection after 15 s
+const WEBRTC_RETRY_AFTER = 600000; // after a failed direct connection, start with the HA route for 10 min
 const MSE_CODECS = ['avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0', 'mp4a.40.2', 'mp4a.40.5', 'flac', 'opus'];
 const TICKS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200];
 
@@ -109,9 +110,18 @@ function returnVideo(v) {
   if (videoPool.length < 3) videoPool.push(v);
 }
 
-// Shared by all cards on the page: when the direct (WebRTC) connection failed recently, e.g. away
-// from home without VPN, go straight to the stream via Home Assistant.
-let webrtcBlockedUntil = 0;
+// Remembered across page/app reloads: when the direct (WebRTC) connection failed recently, e.g. away
+// from home without VPN, start with the stream via Home Assistant right away.
+const DIRECT_FAILED_KEY = 'frigate-doorbell-card:direct-failed-until';
+function directRecentlyFailed() {
+  try { return Date.now() < Number(localStorage.getItem(DIRECT_FAILED_KEY) || 0); } catch (e) { return false; }
+}
+function rememberDirectFailed(failed) {
+  try {
+    if (failed) localStorage.setItem(DIRECT_FAILED_KEY, String(Date.now() + WEBRTC_RETRY_AFTER));
+    else localStorage.removeItem(DIRECT_FAILED_KEY);
+  } catch (e) {}
+}
 
 let hlsLoading = null;
 function loadHlsJs() {
@@ -296,7 +306,7 @@ class FrigateDoorbellCard extends HTMLElement {
     this._mode = 'live';
     this._active = false;
     this._wantSound = true;
-    this._pc = null; this._ws = null; this._micSender = null; this._mic = null; this._micPending = null;
+    this._pc = null; this._rtcWs = null; this._mseWs = null; this._micSender = null; this._mic = null; this._micPending = null;
     this._holding = false; this._hasBackchannel = true;
     this._reconnectTimer = null; this._reconnectDelay = 2000; this._reconnecting = false;
     this._stall = { t: -1, at: 0, forced: false };
@@ -352,8 +362,17 @@ class FrigateDoorbellCard extends HTMLElement {
     if (text && ms) this._statusTimer = setTimeout(() => this._status(''), ms);
   }
 
+  // debug: true → browser console; debug: log → also the Home Assistant log (handy on phones).
   _debug(...args) {
-    if (this._config && this._config.debug) console.info('[frigate-doorbell-card]', ...args);
+    if (!this._config || !this._config.debug) return;
+    const t = ((performance.now() - (this._t0 || 0)) / 1000).toFixed(1) + 's';
+    console.info('[frigate-doorbell-card]', t, ...args);
+    if (this._config.debug === 'log' && this._hass) {
+      const msg = args.map((a) => (a instanceof Error ? a.message : typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+      this._hass.callService('system_log', 'write', {
+        message: `[frigate-doorbell-card ${CARD_VERSION}] ${t} ${msg}`, level: 'warning', logger: 'frigate_doorbell_card',
+      }).catch(() => {});
+    }
   }
 
   // ----- HA helpers -----
@@ -374,16 +393,24 @@ class FrigateDoorbellCard extends HTMLElement {
     if (this._active || !this._clientId || !this._camName || !this._video) return;
     this._active = true;
     this._loadedFrom = now();
-    if (this._config.timeline !== false) {
-      this._loadOlder();
-      this._loadReviews();
-      this._subscribeReviews();
-    }
+    // Live picture first: the timeline fires many requests (recordings, review items, a signed URL
+    // per thumbnail) over the same Home Assistant connection, so load it a moment later.
     this._goLive();
+    if (this._config.timeline !== false) {
+      const gen = this._gen;
+      clearTimeout(this._timelineTimer);
+      this._timelineTimer = setTimeout(() => {
+        if (gen !== this._gen || !this._active) return;
+        this._loadOlder();
+        this._loadReviews();
+        this._subscribeReviews();
+      }, 1500);
+    }
   }
 
   _stop() {
     this._gen = (this._gen || 0) + 1;
+    clearTimeout(this._timelineTimer);
     if (!this._active) return;
     this._active = false;
     this._stopLive();
@@ -400,41 +427,55 @@ class FrigateDoorbellCard extends HTMLElement {
     this._updateBadge();
   }
 
-  // ----- Live (WebRTC via the Frigate integration's go2rtc proxy) -----
+  // ----- Live: direct (WebRTC) and via Home Assistant (MSE), whichever gives a picture first -----
 
-  // The send-only audio track for your voice is negotiated right away without a microphone;
-  // pressing the button only puts the mic in (replaceTrack): instant, no reconnect.
+  // The direct WebRTC connection is always tried: lowest delay, and needed for talking. The stream via
+  // Home Assistant starts right away when the direct route failed recently (e.g. away from home), or
+  // after FAST_FALLBACK when the direct picture isn't there yet. If the direct connection comes up
+  // later (back home, VPN on), the card switches to it seamlessly.
   async _connect() {
-    if (Date.now() < webrtcBlockedUntil) return this._connectMse();
-    return this._connectWebRTC();
-  }
-
-  // The direct connection didn't come up (e.g. away from home without VPN, port 8555 not reachable):
-  // remember that for a while and switch to the stream via Home Assistant.
-  _webrtcFailed(conn) {
-    if (conn !== this._pc || !this._active || this._mode !== 'live') return;
-    this._debug('direct connection failed, switching to stream via Home Assistant');
-    webrtcBlockedUntil = Date.now() + WEBRTC_RETRY_AFTER;
-    this._connectMse().catch((err) => {
-      this._debug('mse failed', err);
-      this._reconnectDelay = Math.min(this._reconnectDelay * 2, 30000);
-      this._scheduleReconnect(this._reconnectDelay);
-    });
-  }
-
-  async _connectWebRTC() {
     this._closeConnection();
-    this._transport = 'webrtc';
+    this._t0 = performance.now();
     const gen = this._gen;
+    const where = this._whereAmI();
+    const recent = directRecentlyFailed();
+    this._debug('connect', { where, directFailedRecently: recent, origin: location.origin });
+    // Sign both stream URLs right away (in parallel), so the fallback doesn't have to wait for it.
+    const src = encodeURIComponent(this._camName);
+    this._rtcUrl = this._signedUrl(`/api/frigate/${this._clientId}/webrtc/api/ws?src=${src}`, 60);
+    this._mseUrl = this._signedUrl(`/api/frigate/${this._clientId}/mse/api/ws?src=${src}`, 60);
+    this._rtcUrl.catch(() => {});
+    this._mseUrl.catch(() => {});
+    this._connectWebRTC(gen).catch((err) => { this._debug('direct error', err); this._directFailed(gen); });
+    if (where === 'away' || recent) this._startMse(gen);                         // away: picture via HA now
+    else if (where === 'unknown') this._fallbackTimer = setTimeout(() => this._startMse(gen), 600);
+    else this._fallbackTimer = setTimeout(() => this._startMse(gen), FAST_FALLBACK); // home: direct first
+  }
+
+  // Where is this browser? The Home Assistant apps switch to the *external URL* when away from home,
+  // so comparing the address in the browser with HA's URL settings tells us without any probing.
+  _whereAmI() {
+    const cfg = (this._hass && this._hass.config) || {};
+    const originOf = (u) => { try { return u ? new URL(u).origin : null; } catch (e) { return null; } };
+    const here = location.origin;
+    const host = location.hostname;
+    if (originOf(cfg.internal_url) === here) return 'home';
+    if (/^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host) || /\.(local|lan|home|internal)$/.test(host)) return 'home';
+    if (originOf(cfg.external_url) === here || host.endsWith('.ui.nabu.casa')) return 'away';
+    return 'unknown';
+  }
+
+  async _connectWebRTC(gen) {
     let everConnected = false;
-    // Stopped (card hidden/removed) or replaced by a newer attempt while awaiting: clean up.
-    const stale = () => gen !== this._gen || conn !== this._pc;
     const conn = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
     this._pc = conn;
+    const stale = () => gen !== this._gen || conn !== this._pc;
     const stream = new MediaStream();
     conn.ontrack = (e) => stream.addTrack(e.track);
     conn.addTransceiver('video', { direction: 'recvonly' });
     conn.addTransceiver('audio', { direction: 'recvonly' });
+    // Send-only audio for your voice, negotiated now without a microphone: pressing the button only
+    // puts the mic in (replaceTrack), so talking starts instantly.
     this._micSender = conn.addTransceiver('audio', { direction: 'sendonly' }).sender;
     if (this._mic && this._holding) this._micSender.replaceTrack(this._mic.getAudioTracks()[0]).catch(() => {});
     conn.onconnectionstatechange = () => {
@@ -442,28 +483,26 @@ class FrigateDoorbellCard extends HTMLElement {
       const st = conn.connectionState;
       if (st === 'connected') {
         everConnected = true;
-        clearTimeout(this._webrtcTimer);
-        this._reconnectDelay = 2000;
-        clearTimeout(this._reconnectTimer);
-        if (this._reconnecting) { this._reconnecting = false; this._status(''); }
+        this._onDirectConnected(conn, stream, gen);
       } else if (st === 'failed') {
-        if (!everConnected) this._webrtcFailed(conn);
-        else this._scheduleReconnect(0);
-      } else if (st === 'disconnected') {
+        if (!everConnected) this._directFailed(gen, conn);
+        else if (this._transport === 'webrtc') this._scheduleReconnect(0);
+      } else if (st === 'disconnected' && this._transport === 'webrtc') {
         this._scheduleReconnect(4000);
       }
     };
+    this._directTimer = setTimeout(() => { if (!everConnected) this._directFailed(gen, conn); }, WEBRTC_GIVE_UP);
 
-    const url = (await this._signedUrl(
-      `/api/frigate/${this._clientId}/webrtc/api/ws?src=${encodeURIComponent(this._camName)}`, 60,
-    )).replace(/^http/, 'ws');
-    if (stale()) { conn.close(); return; }
+    const url = (await this._rtcUrl).replace(/^http/, 'ws');
+    if (stale()) return;
+    this._debug('direct: url signed');
     const ws = new WebSocket(url);
-    this._ws = ws;
+    this._rtcWs = ws;
     await new Promise((resolve, reject) => {
       ws.onopen = resolve;
       ws.onerror = () => reject(new Error('websocket'));
     });
+    if (stale()) return;
     const answer = new Promise((resolve, reject) => {
       ws.onmessage = (ev) => {
         let msg;
@@ -475,8 +514,8 @@ class FrigateDoorbellCard extends HTMLElement {
       };
       ws.onclose = () => {
         reject(new Error('websocket closed'));
-        // The go2rtc consumer lives as long as this websocket: if it closes, reconnect.
-        if (ws === this._ws && conn === this._pc) this._scheduleReconnect(2000);
+        // The go2rtc consumer lives as long as this websocket: if it closes while we show it, reconnect.
+        if (ws === this._rtcWs && this._transport === 'webrtc') this._scheduleReconnect(2000);
       };
     });
     conn.onicecandidate = (e) => {
@@ -487,39 +526,74 @@ class FrigateDoorbellCard extends HTMLElement {
     await conn.setLocalDescription(await conn.createOffer());
     ws.send(JSON.stringify({ type: 'webrtc/offer', value: conn.localDescription.sdp }));
     const sdp = await answer;
-    if (stale()) { try { ws.close(); } catch (e) {} conn.close(); return; }
+    if (stale()) return;
     await conn.setRemoteDescription({ type: 'answer', sdp });
-    clearTimeout(this._webrtcTimer);
-    this._webrtcTimer = setTimeout(() => { if (!everConnected) this._webrtcFailed(conn); }, WEBRTC_TIMEOUT);
     this._hasBackchannel = this._answerHasBackchannel(sdp);
-    this._debug('connected, backchannel:', this._hasBackchannel);
+    this._debug('direct: answer received, backchannel:', this._hasBackchannel);
     this._updateMicUi();
-    if (stale() || this._mode !== 'live' || !this._video) return;
+  }
+
+  _onDirectConnected(conn, stream, gen) {
+    if (gen !== this._gen || conn !== this._pc || this._mode !== 'live' || !this._video) return;
+    clearTimeout(this._fallbackTimer);
+    clearTimeout(this._directTimer);
+    rememberDirectFailed(false);
+    const wasMse = this._transport === 'mse';
+    this._closeMse();
     this._detachHls();
     this._video.removeAttribute('src');
     this._video.srcObject = stream;
+    this._transport = 'webrtc';
     this._liveAttached = true;
     this._stall.at = Date.now();
-    await this._playWithSound();
+    this._reconnectDelay = 2000;
+    clearTimeout(this._reconnectTimer);
+    if (this._reconnecting) { this._reconnecting = false; this._status(''); }
+    this._updateMicUi();
+    this._debug(wasMse ? 'direct connected: switched from Home Assistant stream' : 'direct connected');
+    this._playWithSound();
   }
 
-  // Fallback: go2rtc's MSE stream (fragmented MP4 over a websocket) through the Frigate integration.
+  // The direct connection didn't come up (e.g. away from home without VPN, port 8555 not reachable).
+  _directFailed(gen, conn) {
+    if (gen !== this._gen || (conn && conn !== this._pc)) return;
+    this._debug('direct failed');
+    rememberDirectFailed(true);
+    this._closeWebRTC();
+    if (this._mode === 'live') this._startMse(gen);
+  }
+
+  _startMse(gen) {
+    if (gen !== this._gen || !this._active || this._mode !== 'live' || this._transport === 'webrtc' || this._mseWs || this._msePending) return;
+    this._msePending = true;
+    this._connectMse(gen).catch((err) => {
+      this._debug('stream via Home Assistant failed', err);
+      this._closeMse();
+      if (this._transport !== 'webrtc') {
+        this._reconnectDelay = Math.min(this._reconnectDelay * 2, 30000);
+        this._scheduleReconnect(this._reconnectDelay);
+      }
+    }).finally(() => { this._msePending = false; });
+  }
+
+  // go2rtc's MSE stream (fragmented MP4 over a websocket) through the Frigate integration.
   // Works wherever Home Assistant works; a bit more delay and no talking (that needs WebRTC).
-  async _connectMse() {
-    this._closeConnection();
-    this._transport = 'mse';
-    this._updateMicUi();
-    const gen = this._gen;
+  async _connectMse(gen) {
     const MS = window.ManagedMediaSource || window.MediaSource;
     if (!MS) throw new Error('no MediaSource');
-    const url = (await this._signedUrl(
-      `/api/frigate/${this._clientId}/mse/api/ws?src=${encodeURIComponent(this._camName)}`, 60,
-    )).replace(/^http/, 'ws');
-    if (gen !== this._gen || this._mode !== 'live' || !this._video) return;
+    // Signed at connect; signatures are short-lived, so sign again on a later (re)start.
+    let url;
+    try { url = await this._mseUrl; } catch (e) { url = null; }
+    if (!url || performance.now() - this._t0 > 45000) {
+      url = await this._signedUrl(`/api/frigate/${this._clientId}/mse/api/ws?src=${encodeURIComponent(this._camName)}`, 60);
+    }
+    url = url.replace(/^http/, 'ws');
+    if (gen !== this._gen || this._mode !== 'live' || !this._video || this._transport === 'webrtc') return;
+    this._debug('ha: url signed');
     const v = this._video;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
-    this._ws = ws;
+    this._mseWs = ws;
     const ms = new MS();
     this._ms = ms;
     v.srcObject = null;
@@ -534,7 +608,7 @@ class FrigateDoorbellCard extends HTMLElement {
       new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = () => reject(new Error('websocket')); }),
       new Promise((resolve) => ms.addEventListener('sourceopen', resolve, { once: true })),
     ]);
-    if (ws !== this._ws) return;
+    if (ws !== this._mseWs) return;
     const codecs = MSE_CODECS.filter((c) => MS.isTypeSupported(`video/mp4; codecs="${c}"`)).join();
     ws.send(JSON.stringify({ type: 'mse', value: codecs }));
 
@@ -545,6 +619,7 @@ class FrigateDoorbellCard extends HTMLElement {
       try { sb.appendBuffer(queue.shift()); } catch (e) { queue = []; }
     };
     ws.onmessage = (ev) => {
+      if (ws !== this._mseWs) return;
       if (typeof ev.data === 'string') {
         let msg;
         try { msg = JSON.parse(ev.data); } catch (e) { return; }
@@ -561,11 +636,15 @@ class FrigateDoorbellCard extends HTMLElement {
             }
             pump();
           });
+          this._transport = 'mse';
           this._liveAttached = true;
           this._stall.at = Date.now();
+          this._updateMicUi();
+          if (this._reconnecting) { this._reconnecting = false; this._status(''); }
+          this._debug('ha: streaming');
           this._playWithSound();
         } else if (msg.type === 'error') {
-          this._debug('mse error', msg.value);
+          this._debug('ha: error', msg.value);
         }
       } else {
         queue.push(ev.data);
@@ -573,10 +652,8 @@ class FrigateDoorbellCard extends HTMLElement {
       }
     };
     ws.onclose = () => {
-      if (ws === this._ws) this._scheduleReconnect(2000);
+      if (ws === this._mseWs && this._transport === 'mse') this._scheduleReconnect(2000);
     };
-    this._debug('streaming via Home Assistant (mse), codecs:', codecs);
-    if (this._reconnecting) { this._reconnecting = false; this._status(''); }
   }
 
   // go2rtc only accepts our send-only audio section if the stream has a backchannel source.
@@ -588,14 +665,27 @@ class FrigateDoorbellCard extends HTMLElement {
     return !/\ba=inactive\b/.test(ours) && !/^audio 0 /.test(ours);
   }
 
-  _closeConnection() {
-    clearTimeout(this._webrtcTimer);
-    this._liveAttached = false;
-    if (this._ws) { const ws = this._ws; this._ws = null; ws.onclose = null; try { ws.close(); } catch (e) {} }
-    if (this._ms) { this._ms = null; }
-    if (this._msUrl) { URL.revokeObjectURL(this._msUrl); this._msUrl = null; }
+  _closeWebRTC() {
+    clearTimeout(this._directTimer);
+    if (this._rtcWs) { const ws = this._rtcWs; this._rtcWs = null; ws.onclose = null; try { ws.close(); } catch (e) {} }
     if (this._pc) { const pc = this._pc; this._pc = null; pc.onconnectionstatechange = null; pc.close(); }
     this._micSender = null;
+    if (this._transport === 'webrtc') { this._transport = null; this._liveAttached = false; }
+  }
+
+  _closeMse() {
+    if (this._mseWs) { const ws = this._mseWs; this._mseWs = null; ws.onclose = null; ws.onmessage = null; try { ws.close(); } catch (e) {} }
+    this._ms = null;
+    if (this._msUrl) { URL.revokeObjectURL(this._msUrl); this._msUrl = null; }
+    if (this._transport === 'mse') { this._transport = null; this._liveAttached = false; }
+  }
+
+  _closeConnection() {
+    clearTimeout(this._fallbackTimer);
+    this._closeWebRTC();
+    this._closeMse();
+    this._transport = null;
+    this._liveAttached = false;
   }
 
   _scheduleReconnect(delay) {

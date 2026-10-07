@@ -62,7 +62,7 @@ All options:
 | `microphone` | `true` | Show the push-to-talk button |
 | `frigate_camera` | from entity | Camera name in Frigate, only if it differs |
 | `frigate_client_id` | from entity | Frigate instance, only with multiple Frigate servers |
-| `debug` | `false` | Log diagnostics to the browser console |
+| `debug` | `false` | `true`: log diagnostics to the browser console; `log`: also to the Home Assistant log |
 
 The card has a visual editor as well.
 
@@ -170,12 +170,14 @@ for the RTSP producer.
 
 ## Notes
 
-- **Live view from outside your home**: the card first tries a direct WebRTC connection to go2rtc (lowest delay,
-  needed for talking). That works on your LAN, over VPN, or from the internet when go2rtc's port 8555 is reachable.
-  If it doesn't connect within 8 seconds, the card automatically switches to a stream **via Home Assistant**
-  (go2rtc MSE through the Frigate integration): works wherever Home Assistant works, ~1–2 s more delay,
-  and the microphone button is hidden because talking needs the direct connection. The card remembers this for
-  10 minutes so it doesn't wait again every time.
+- **Live view from outside your home**: the card uses two routes and shows whichever gives a picture first:
+  a direct WebRTC connection to go2rtc (lowest delay, needed for talking; works on your LAN, over VPN, or from the
+  internet when go2rtc's port 8555 is reachable), and a stream **via Home Assistant** (go2rtc MSE through the
+  Frigate integration; works wherever Home Assistant works, no talking). It decides instantly where you are by
+  comparing the address in the browser with Home Assistant's *external URL* (Settings → System → Network) — the
+  Home Assistant apps switch to that URL when you're away. Away: picture via Home Assistant within a second, while
+  the direct connection is tried in the background and taken over as soon as it works (e.g. VPN on).
+  A failed direct connection is remembered for 10 minutes.
 - **iPhone**: sound starts immediately because the card unlocks audio on your first tap in Home Assistant.
 - Playback uses the browser's own HLS player on Safari/iOS and [hls.js](https://github.com/video-dev/hls.js) elsewhere
   (loaded from cdnjs when needed).
