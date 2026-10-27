@@ -305,7 +305,7 @@ class FrigateDoorbellCard extends HTMLElement {
     // State
     this._mode = 'live';
     this._active = false;
-    this._wantSound = true;
+    this._wantSound = !(this._config && this._config.start_muted === true);
     this._pc = null; this._rtcWs = null; this._mseWs = null; this._micSender = null; this._mic = null; this._micPending = null;
     this._holding = false; this._hasBackchannel = true;
     this._reconnectTimer = null; this._reconnectDelay = 2000; this._reconnecting = false;
@@ -1275,6 +1275,7 @@ class FrigateDoorbellCardEditor extends HTMLElement {
       this._form.computeLabel = (s) => ({
         camera: 'Camera (Frigate)', chime: 'Chime (number entity, optional)', chime_volume: 'Chime volume when on',
         history_days: 'Timeline history (days)', timeline: 'Show timeline', microphone: 'Show microphone button',
+        start_muted: 'Start muted',
       })[s.name] || s.name;
       this._form.addEventListener('value-changed', (ev) => {
         const config = { ...ev.detail.value };
@@ -1292,6 +1293,7 @@ class FrigateDoorbellCardEditor extends HTMLElement {
       { name: 'history_days', selector: { number: { min: 1, max: 30, mode: 'box' } } },
       { name: 'timeline', selector: { boolean: {} } },
       { name: 'microphone', selector: { boolean: {} } },
+      { name: 'start_muted', selector: { boolean: {} } },
     ];
   }
 }

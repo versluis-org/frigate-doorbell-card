@@ -60,6 +60,7 @@ All options:
 | `history_days` | `7` | How far back the timeline goes |
 | `timeline` | `true` | Show the timeline |
 | `microphone` | `true` | Show the push-to-talk button |
+| `start_muted` | `false` | Start the live view muted; the speaker button turns sound on |
 | `frigate_camera` | from entity | Camera name in Frigate, only if it differs |
 | `frigate_client_id` | from entity | Frigate instance, only with multiple Frigate servers |
 | `debug` | `false` | `true`: log diagnostics to the browser console; `log`: also to the Home Assistant log |
